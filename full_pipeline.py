@@ -303,3 +303,4 @@ if __name__ == "__main__":
     # Optional: save as PLY (without color)
     save_ply("reconstruction.ply", X_opt)
 
+
