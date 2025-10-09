@@ -9,8 +9,11 @@ from scipy.optimize import least_squares
 image_path_1 = 'data/im1_real.jpeg'
 image_path_2 = 'data/im2_real.jpeg'
 sift_matches_output_path = 'sift_matches_all.png'
+sift_selected_matches_output_path = 'sift_selected_matches_numbered.png'  # NEW
+image1_numbered_output_path = 'image1_selected_points_numbered.png'  # NEW
+image2_numbered_output_path = 'image2_selected_points_numbered.png'  # NEW
 reconstructed_scene_output_path = 'reconstructed_scene_dense.ply'
-reconstructed_scene_render_output_path = 'reconstructed_scene_render.png'
+reconstructed_scene_render_output_path = 'reconstructed_scene_render_numbered.png'  # UPDATED
 
 # --- 1. Load Images ---
 print("="*60)
@@ -318,47 +321,131 @@ _, R, t, mask_pose = cv2.recoverPose(E, pts1, pts2, K1)
 print(f"    Recovered rotation R and translation t")
 print(f"    Number of points in front of both cameras: {np.sum(mask_pose)}")
 
-# --- 7. Triangulation (Dense Point Cloud) ---
-print("\n[7] Triangulating 3D points for DENSE reconstruction...")
+# --- 7. Triangulation (High-Quality Points Only) ---
+print("\n[7] Selecting HIGH-QUALITY correspondence points for triangulation...")
 
-# Use ALL good matches for dense reconstruction
+# Strategy: Use only the BEST matches with lowest reprojection error
+# This gives better 3D reconstruction quality
+
+# Define projection matrices
 P1 = K1 @ np.hstack((np.eye(3), np.zeros((3, 1))))
 P2 = K2 @ np.hstack((R, t))
 
-pts1_triang = pts1.T
-pts2_triang = pts2.T
+# First, compute reprojection errors for ALL matches using the estimated F matrix
+pts1_h = np.hstack([pts1, np.ones((pts1.shape[0], 1))])
+pts2_h = np.hstack([pts2, np.ones((pts2.shape[0], 1))])
+
+# Compute symmetric epipolar distance for each correspondence
+epipolar_errors = []
+for i in range(len(pts1)):
+    p1 = pts1_h[i]
+    p2 = pts2_h[i]
+    
+    # Distance from point to epipolar line
+    l2 = F_gold @ p1  # Epipolar line in image 2
+    l1 = F_gold.T @ p2  # Epipolar line in image 1
+    
+    # Point-to-line distance
+    dist1 = np.abs(p2.T @ F_gold @ p1) / np.sqrt(l2[0]**2 + l2[1]**2)
+    dist2 = np.abs(p2.T @ F_gold @ p1) / np.sqrt(l1[0]**2 + l1[1]**2)
+    
+    # Symmetric epipolar distance
+    epipolar_errors.append((dist1 + dist2) / 2)
+
+epipolar_errors = np.array(epipolar_errors)
+
+# Select top N points with lowest epipolar error
+NUM_SELECTED_POINTS = 50  # Small number of high-quality points
+best_indices = np.argsort(epipolar_errors)[:NUM_SELECTED_POINTS]
+
+# Extract selected high-quality correspondences
+pts1_selected = pts1[best_indices]
+pts2_selected = pts2[best_indices]
+selected_matches = [good_matches[i] for i in best_indices]
+
+print(f"    Selected {NUM_SELECTED_POINTS} highest-quality correspondence points")
+print(f"    Mean epipolar error of selected points: {np.mean(epipolar_errors[best_indices]):.4f} pixels")
+print(f"    Max epipolar error of selected points: {np.max(epipolar_errors[best_indices]):.4f} pixels")
+
+# Triangulate ONLY the selected high-quality points
+pts1_triang = pts1_selected.T
+pts2_triang = pts2_selected.T
 
 X_homogeneous = cv2.triangulatePoints(P1, P2, pts1_triang, pts2_triang)
-X_3D_raw = (X_homogeneous[:3] / X_homogeneous[3]).T
+X_3D = (X_homogeneous[:3] / X_homogeneous[3]).T
 
-# Filter valid points (in front of both cameras, reasonable depth)
+# Filter valid points (reasonable depth)
 z_threshold = 0.1
-max_z = 50  # Adjust based on scene scale
-valid_indices = (X_3D_raw[:, 2] > z_threshold) & (X_3D_raw[:, 2] < max_z)
+max_z = 50
+valid_indices = (X_3D[:, 2] > z_threshold) & (X_3D[:, 2] < max_z)
 
-# Additional filtering: check reprojection error
-def compute_reprojection_error(X_3D, pts_2d, P):
-    """Compute reprojection error for 3D points."""
-    X_homog = np.hstack([X_3D, np.ones((X_3D.shape[0], 1))])
-    pts_reproj_homog = (P @ X_homog.T).T
-    pts_reproj = pts_reproj_homog[:, :2] / pts_reproj_homog[:, 2:3]
-    errors = np.linalg.norm(pts_2d - pts_reproj, axis=1)
-    return errors
+X_3D_filtered = X_3D[valid_indices]
+pts1_final = pts1_selected[valid_indices]
+pts2_final = pts2_selected[valid_indices]
+point_numbers = np.arange(len(X_3D_filtered))
 
-reproj_errors_1 = compute_reprojection_error(X_3D_raw, pts1, P1)
-reproj_errors_2 = compute_reprojection_error(X_3D_raw, pts2, P2)
-reproj_threshold = 5.0  # pixels
-valid_reproj = (reproj_errors_1 < reproj_threshold) & (reproj_errors_2 < reproj_threshold)
+print(f"    Final 3D points after depth filtering: {len(X_3D_filtered)}")
 
-valid_indices = valid_indices & valid_reproj
-X_3D_filtered = X_3D_raw[valid_indices]
+# --- 8. Visualization with NUMBERING ---
+print("\n[8] Creating numbered visualizations...")
 
-print(f"    Reconstructed {len(X_3D_filtered)} valid 3D points (DENSE point cloud)")
-print(f"    Mean reprojection error: {np.mean(reproj_errors_1[valid_indices]):.2f} pixels")
+# 8a. Numbered matches visualization
+img_matches_numbered = cv2.drawMatches(
+    img1_color, kp1, 
+    img2_color, kp2, 
+    [selected_matches[i] for i in range(len(selected_matches)) if valid_indices[i]], 
+    None,
+    matchColor=(0, 255, 0),
+    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+)
 
-# --- 8. Visualization and Saving ---
+# Add numbers to matched points
+for i, match_idx in enumerate(np.where(valid_indices)[0]):
+    m = selected_matches[match_idx]
+    p1 = kp1[m.queryIdx].pt
+    p2 = kp2[m.trainIdx].pt
+    
+    # Number on image 1 (left side)
+    cv2.circle(img_matches_numbered, (int(p1[0]), int(p1[1])), 8, (0, 0, 255), 2)
+    cv2.putText(img_matches_numbered, str(i), 
+                (int(p1[0]) - 10, int(p1[1]) - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    
+    # Number on image 2 (right side, offset by image1 width)
+    p2_offset = (int(p2[0] + img1_color.shape[1]), int(p2[1]))
+    cv2.circle(img_matches_numbered, p2_offset, 8, (255, 0, 0), 2)
+    cv2.putText(img_matches_numbered, str(i), 
+                (p2_offset[0] - 10, p2_offset[1] - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+cv2.imwrite(sift_selected_matches_output_path, img_matches_numbered)
+print(f"    Numbered matches saved to {sift_selected_matches_output_path}")
+
+# 8b. Numbered points on Image 1
+img1_numbered = img1_color.copy()
+for i in range(len(pts1_final)):
+    p = pts1_final[i]
+    cv2.circle(img1_numbered, (int(p[0]), int(p[1])), 8, (0, 0, 255), 2)
+    cv2.putText(img1_numbered, str(i), 
+                (int(p[0]) + 10, int(p[1]) - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+cv2.imwrite(image1_numbered_output_path, img1_numbered)
+print(f"    Image 1 with numbered points saved to {image1_numbered_output_path}")
+
+# 8c. Numbered points on Image 2
+img2_numbered = img2_color.copy()
+for i in range(len(pts2_final)):
+    p = pts2_final[i]
+    cv2.circle(img2_numbered, (int(p[0]), int(p[1])), 8, (255, 0, 0), 2)
+    cv2.putText(img2_numbered, str(i), 
+                (int(p[0]) + 10, int(p[1]) - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+cv2.imwrite(image2_numbered_output_path, img2_numbered)
+print(f"    Image 2 with numbered points saved to {image2_numbered_output_path}")
 if len(X_3D_filtered) > 0:
-    print("\n[8] Visualizing and saving results...")
+    print("\n[9] Creating 3D visualization and saving results...")
     
     # Create point cloud
     pcd = o3d.geometry.PointCloud()
@@ -366,8 +453,8 @@ if len(X_3D_filtered) > 0:
     
     # Assign colors based on image 1
     colors = []
-    for idx in np.where(valid_indices)[0]:
-        x, y = int(pts1[idx, 0]), int(pts1[idx, 1])
+    for i in range(len(pts1_final)):
+        x, y = int(pts1_final[i, 0]), int(pts1_final[i, 1])
         if 0 <= x < img1_color.shape[1] and 0 <= y < img1_color.shape[0]:
             color = img1_color[y, x] / 255.0  # Normalize to [0, 1]
             colors.append(color[::-1])  # BGR to RGB
@@ -378,19 +465,48 @@ if len(X_3D_filtered) > 0:
     
     # Save to PLY
     o3d.io.write_point_cloud(reconstructed_scene_output_path, pcd)
-    print(f"    Dense 3D point cloud saved to {reconstructed_scene_output_path}")
+    print(f"    3D point cloud saved to {reconstructed_scene_output_path}")
     
-    # Matplotlib visualization
-    fig = plt.figure(figsize=(14, 10))
+    # Create detailed depth report
+    print("\n" + "="*70)
+    print("DEPTH ANALYSIS FOR NUMBERED POINTS")
+    print("="*70)
+    print(f"{'Point #':<10} {'X (m)':<12} {'Y (m)':<12} {'Z (m)':<12} {'Depth Rank':<12}")
+    print("-"*70)
+    
+    # Sort by depth (Z coordinate)
+    depth_order = np.argsort(X_3D_filtered[:, 2])
+    
+    for rank, idx in enumerate(depth_order):
+        x, y, z = X_3D_filtered[idx]
+        print(f"{idx:<10} {x:>11.4f} {y:>11.4f} {z:>11.4f} {rank+1:<12}")
+    
+    print("-"*70)
+    print(f"Closest point: #{depth_order[0]} at Z={X_3D_filtered[depth_order[0], 2]:.4f}m")
+    print(f"Farthest point: #{depth_order[-1]} at Z={X_3D_filtered[depth_order[-1], 2]:.4f}m")
+    print(f"Mean depth: {np.mean(X_3D_filtered[:, 2]):.4f}m")
+    print("="*70)
+    
+    # Matplotlib visualization with numbers
+    fig = plt.figure(figsize=(16, 12))
     ax = fig.add_subplot(111, projection='3d')
     
+    # Plot points with colors
     ax.scatter(X_3D_filtered[:, 0], X_3D_filtered[:, 1], X_3D_filtered[:, 2], 
-               c=colors, s=1, marker='.')
+               c=colors, s=100, marker='o', edgecolors='black', linewidths=1.5)
     
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_zlabel('Z (m)')
-    ax.set_title(f'Dense 3D Reconstructed Point Cloud ({len(X_3D_filtered)} points)\nGold Standard Method')
+    # Add numbers to each 3D point
+    for i in range(len(X_3D_filtered)):
+        ax.text(X_3D_filtered[i, 0], X_3D_filtered[i, 1], X_3D_filtered[i, 2], 
+                str(i), fontsize=10, weight='bold', 
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+    
+    ax.set_xlabel('X (m)', fontsize=12, weight='bold')
+    ax.set_ylabel('Y (m)', fontsize=12, weight='bold')
+    ax.set_zlabel('Z (Depth in m)', fontsize=12, weight='bold')
+    ax.set_title(f'3D Reconstructed Scene with Numbered Points ({len(X_3D_filtered)} points)\n'
+                 f'Gold Standard Method - High Quality Correspondences Only', 
+                 fontsize=14, weight='bold')
     
     # Set equal aspect ratio
     max_range = np.array([X_3D_filtered[:, 0].max()-X_3D_filtered[:, 0].min(),
@@ -405,21 +521,28 @@ if len(X_3D_filtered) > 0:
     ax.set_ylim(mid_y - max_range, mid_y + max_range)
     ax.set_zlim(mid_z - max_range, mid_z + max_range)
     
+    # Add grid
+    ax.grid(True, alpha=0.3)
+    
     plt.tight_layout()
     fig.savefig(reconstructed_scene_render_output_path, dpi=300, bbox_inches='tight')
-    print(f"    3D visualization saved to {reconstructed_scene_render_output_path}")
+    print(f"\n    Numbered 3D visualization saved to {reconstructed_scene_render_output_path}")
     
     plt.show()
     
-    print("\n" + "="*60)
+    print("\n" + "="*70)
     print("RECONSTRUCTION COMPLETE!")
-    print("="*60)
+    print("="*70)
     print(f"Algorithm Used: Gold Standard Method (Hartley & Zisserman)")
-    print(f"Total 3D points: {len(X_3D_filtered)}")
-    print(f"Output files:")
-    print(f"  - {sift_matches_output_path}")
-    print(f"  - {reconstructed_scene_output_path}")
-    print(f"  - {reconstructed_scene_render_output_path}")
+    print(f"Quality Strategy: Small number of high-quality correspondences")
+    print(f"Total 3D points reconstructed: {len(X_3D_filtered)}")
+    print(f"\nOutput files:")
+    print(f"  1. {sift_matches_output_path} - All SIFT matches")
+    print(f"  2. {sift_selected_matches_output_path} - Selected numbered matches")
+    print(f"  3. {image1_numbered_output_path} - Image 1 with numbered points")
+    print(f"  4. {image2_numbered_output_path} - Image 2 with numbered points")
+    print(f"  5. {reconstructed_scene_output_path} - 3D point cloud (PLY)")
+    print(f"  6. {reconstructed_scene_render_output_path} - Numbered 3D visualization")
     
 else:
     print("\nERROR: No valid 3D points reconstructed!")
